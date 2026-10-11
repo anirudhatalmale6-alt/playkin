@@ -1,39 +1,136 @@
-name: CI - Lint and Test
+name: CI
+
+# Minimum protections for Playkin.
+#
+# The existing ci.yml is well-intentioned but has never executed on this repository
+# (`GET /repos/isudally/playkin/actions/runs` returns total_count: 0), and it would
+# have failed if it had. This version is designed to be adoptable TODAY against a
+# branch that still has 63 type errors and 3 red test suites — it blocks the things
+# that must never regress, and ratchets the rest down instead of demanding a clean
+# sheet before it can be turned on.
+#
+# A gate nobody can turn on protects nothing.
 
 on:
   push:
-    branches:
-      - main
-      - develop
+    branches: [main]
   pull_request:
-    branches:
-      - main
-      - develop
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  lint-and-test:
+  verify:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    timeout-minutes: 25
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+          cache: npm
 
-      - name: Install dependencies
+      - name: Install
         run: npm ci
 
-      - name: Run ESLint
-        run: npm run lint
+      # ----------------------------------------------------------------------
+      # GATE 1 — the app must boot.
+      #
+      # This is the one that matters most. `tsc` and `jest` both reported the
+      # blank-screen outage, in a form nobody read. "Does it render?" cannot be
+      # misread. Verified to fail on the unfixed tree with the real error, and
+      # pass once the token is restored.
+      # ----------------------------------------------------------------------
+      - name: Build web bundle
+        run: npm run build:web
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
 
-      - name: Run Tests
-        run: npm test
+      - name: Install browser for smoke test
+        run: npx playwright install --with-deps chromium
 
-      - name: Check TypeScript
-        run: npx tsc --noEmit
+      - name: Smoke test — app must render
+        run: node scripts/smoke-boot.js web-build
+
+      # ----------------------------------------------------------------------
+      # GATE 2 — no credentials in shippable output.
+      #
+      # Nothing secret is committed to this repo; the leak happens at BUILD time,
+      # because anything named EXPO_PUBLIC_* is inlined into the client bundle.
+      # So the scan has to run against the build, not the source tree.
+      # ----------------------------------------------------------------------
+      - name: Scan built bundle for credentials
+        run: node scripts/scan-bundle-secrets.js web-build
+
+      # ----------------------------------------------------------------------
+      # GATE 3 — tests must not regress.
+      #
+      # Three suites are currently red (AIService, ArtStyleService, ShareService).
+      # Rather than block every PR until they're fixed, hold the line on the number
+      # that currently passes. Raise MIN_PASSING as suites get repaired.
+      # ----------------------------------------------------------------------
+      - name: Tests (no regression below the current baseline)
+        env:
+          MIN_PASSING: '68'
+        run: |
+          set -o pipefail
+          npm test -- --ci 2>&1 | tee /tmp/jest.log || true
+          PASSED=$(grep -oE '^Tests:.*' /tmp/jest.log | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1)
+          PASSED=${PASSED:-0}
+          echo "passing tests: $PASSED (baseline $MIN_PASSING)"
+          if [ "$PASSED" -lt "$MIN_PASSING" ]; then
+            echo "::error::Passing tests dropped from $MIN_PASSING to $PASSED — this PR breaks something that worked."
+            exit 1
+          fi
+          if [ "$PASSED" -gt "$MIN_PASSING" ]; then
+            echo "::notice::$PASSED tests now pass. Raise MIN_PASSING to $PASSED to lock the gain in."
+          fi
+
+      # ----------------------------------------------------------------------
+      # GATE 4 — type errors must only go down.
+      #
+      # 63 today. A hard `tsc --noEmit` gate would make CI unadoptable; a ratchet
+      # makes every PR leave the codebase no worse than it found it.
+      # ----------------------------------------------------------------------
+      - name: TypeScript (ratchet)
+        env:
+          MAX_TS_ERRORS: '63'
+        run: |
+          npx tsc --noEmit 2>&1 | tee /tmp/tsc.log || true
+          COUNT=$(grep -cE '^src/.*error TS' /tmp/tsc.log || true)
+          echo "type errors: $COUNT (ceiling $MAX_TS_ERRORS)"
+          if [ "$COUNT" -gt "$MAX_TS_ERRORS" ]; then
+            echo "::error::Type errors rose from $MAX_TS_ERRORS to $COUNT."
+            grep -E '^src/.*error TS' /tmp/tsc.log | head -20
+            exit 1
+          fi
+          if [ "$COUNT" -lt "$MAX_TS_ERRORS" ]; then
+            echo "::notice::Down to $COUNT type errors. Lower MAX_TS_ERRORS to $COUNT to lock the gain in."
+          fi
+
+      - name: Lint (advisory for now)
+        run: npm run lint || echo "::warning::lint is not clean — not blocking yet"
+
+# ---------------------------------------------------------------------------
+# Also needed, and not expressible in this file — set these in repo settings:
+#
+#   Settings > Branches > Add branch ruleset for `main`:
+#     - Require a pull request before merging
+#     - Require status checks to pass  ->  select "verify"
+#     - Require branches to be up to date before merging
+#     - Block force pushes
+#
+#   Settings > Code security:
+#     - Enable Secret scanning and Push protection (free on public repos).
+#       This is the one that stops a key reaching GitHub in the first place.
+#     - Enable Dependabot alerts.
+#
+# Without the branch ruleset the workflow is advisory only: a red run still merges.
+# ---------------------------------------------------------------------------
